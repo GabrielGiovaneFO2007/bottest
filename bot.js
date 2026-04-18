@@ -575,7 +575,8 @@ client.on('interactionCreate', async (interaction) => {
   }
 });
 
-// Text commands (prefix-based, kept as fallback)client.on('messageCreate', async (message) => {
+// Text commands (prefix-based, kept as fallback)
+client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
   if (!message.content.startsWith('!')) return;
 
