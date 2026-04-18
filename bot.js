@@ -1,11 +1,35 @@
 /**
  * Discord Voice Agent Bot
- * Listens to voice channels, transcribes with whisper.cpp,
- * queries Ollama, and speaks responses with Kokoro TTS.
  *
- * Dependencies:
- *   npm install discord.js @discordjs/voice prism-media axios dotenv
- *   plus a voice backend for TTS (local Python env or a TTS HTTP server)
+ * Required .env keys:
+ * BOT_TOKEN
+ * CLIENT_ID
+ * GUILD_ID
+ * AUTO_JOIN_CHANNEL_ID
+ * OWNER_USER_ID
+ * OLLAMA_URL
+ * OLLAMA_MODEL
+ * WHISPER_BIN
+ * WHISPER_MODEL
+ * WHISPER_LANG
+ * TTS_ENGINE=piper|server
+ * PIPER_BIN
+ * PIPER_MODEL
+ * PIPER_LENGTH_SCALE
+ * PIPER_NOISE_SCALE
+ * PIPER_NOISE_W
+ * TTS_SERVER_URL
+ * RMS_THRESHOLD
+ * MIN_AUDIO_MS
+ * SILENCE_MS
+ * DEBOUNCE_MS
+ * SYSTEM_PROMPT
+ * PREFIX
+ *
+ * Notes:
+ * - Use a Discord.js / @discordjs/voice version compatible with your Node version.
+ * - If you run Node 20, do not keep an @discordjs/voice release that requires Node 22+.
+ * - This file supports both slash commands and prefix commands.
  */
 
 require('dotenv').config();
@@ -25,62 +49,94 @@ const prism = require('prism-media');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFile } = require('child_process');
 const axios = require('axios');
+const { execFile, spawn } = require('child_process');
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // CONFIG
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
-const BOT_TOKEN = process.env.BOT_TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID;
+const CFG = {
+  BOT_TOKEN: process.env.BOT_TOKEN || '',
+  CLIENT_ID: process.env.CLIENT_ID || '',
+  GUILD_ID: process.env.GUILD_ID || '',
 
-const AUTO_JOIN_CHANNEL = process.env.AUTO_JOIN_CHANNEL_ID || null;
-const OWNER_USER_ID = process.env.OWNER_USER_ID || null;
+  AUTO_JOIN_CHANNEL_ID: process.env.AUTO_JOIN_CHANNEL_ID || '',
+  OWNER_USER_ID: process.env.OWNER_USER_ID || '',
 
-const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat';
-const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:3b';
+  OLLAMA_URL: process.env.OLLAMA_URL || 'http://localhost:11434/api/chat',
+  OLLAMA_MODEL: process.env.OLLAMA_MODEL || 'llama3.2:3b',
+  OLLAMA_MAX_HISTORY: Number(process.env.OLLAMA_MAX_HISTORY || '20'),
 
-const WHISPER_BIN =
-  process.env.WHISPER_BIN ||
-  findFirstExisting([
+  WHISPER_BIN: process.env.WHISPER_BIN || findFirstExisting([
     path.join(os.homedir(), 'whisper.cpp/build/bin/whisper-cli'),
     path.join(os.homedir(), 'whisper.cpp/build/bin/main'),
     path.join(os.homedir(), 'whisper.cpp/main'),
-  ]);
+  ]),
+  WHISPER_MODEL: process.env.WHISPER_MODEL || path.join(os.homedir(), 'whisper.cpp/models/ggml-base.en.bin'),
+  WHISPER_LANG: process.env.WHISPER_LANG || 'pt',
 
-const WHISPER_MODEL_PATH =
-  process.env.WHISPER_MODEL ||
-  path.join(os.homedir(), 'whisper.cpp/models/ggml-base.en.bin');
+  TTS_ENGINE: (process.env.TTS_ENGINE || 'piper').toLowerCase(),
+  TTS_SERVER_URL: process.env.TTS_SERVER_URL || '',
 
-const WHISPER_LANG = process.env.WHISPER_LANG || 'pt';
+  PIPER_BIN: process.env.PIPER_BIN || path.join(os.homedir(), 'piper/piper/piper'),
+  PIPER_MODEL: process.env.PIPER_MODEL || path.join(os.homedir(), 'piper/voices/pt_BR-faber-medium.onnx'),
+  PIPER_LENGTH_SCALE: process.env.PIPER_LENGTH_SCALE || '1.15',
+  PIPER_NOISE_SCALE: process.env.PIPER_NOISE_SCALE || '0.6',
+  PIPER_NOISE_W: process.env.PIPER_NOISE_W || '0.8',
 
-const KOKORO_MODEL = process.env.KOKORO_MODEL || path.join(os.homedir(), 'kokoro-v1.0.onnx');
-const KOKORO_VOICES = process.env.KOKORO_VOICES || path.join(os.homedir(), 'voices-v1.0.bin');
-const TTS_SERVER_URL = process.env.TTS_SERVER_URL || ''; // optional, e.g. http://localhost:5500/tts
-const TTS_PYTHON_BIN = process.env.TTS_PYTHON_BIN || 'python3';
+  RMS_THRESHOLD: Number(process.env.RMS_THRESHOLD || '0.015'),
+  MIN_AUDIO_MS: Number(process.env.MIN_AUDIO_MS || '600'),
+  SILENCE_MS: Number(process.env.SILENCE_MS || '1000'),
+  DEBOUNCE_MS: Number(process.env.DEBOUNCE_MS || '300'),
 
-const SYSTEM_PROMPT = process.env.SYSTEM_PROMPT ||
-  'Você é um assistente de voz útil em um canal do Discord. Responda de forma natural, clara e concisa. ' +
-  'Evite markdown quando não for necessário. Se o usuário falar em português, responda em português.';
+  SYSTEM_PROMPT: process.env.SYSTEM_PROMPT ||
+    'Você é um assistente de voz útil dentro de um canal do Discord. Responda de forma natural, clara e curta. ' +
+    'Se o usuário falar em português, responda em português. Evite markdown quando não for necessário.',
 
-// Audio / speech tuning
+  PREFIX: process.env.PREFIX || '!',
+  DEBUG: String(process.env.DEBUG || '').toLowerCase() === '1',
+};
+
 const DISCORD_SAMPLE_RATE = 48000;
 const DISCORD_CHANNELS = 2;
 const WHISPER_SAMPLE_RATE = 16000;
 const FRAME_SIZE = 960;
 
-// Lower latency defaults
-const SILENCE_DURATION_MS = Number(process.env.SILENCE_DURATION_MS || 1200);
-const MIN_AUDIO_DURATION_MS = Number(process.env.MIN_AUDIO_DURATION_MS || 1200);
-const DEBOUNCE_MS = Number(process.env.DEBOUNCE_MS || 300);
+if (!CFG.BOT_TOKEN) {
+  console.error('[Config] BOT_TOKEN is missing');
+  process.exit(1);
+}
+if (!CFG.CLIENT_ID) {
+  console.error('[Config] CLIENT_ID is missing');
+  process.exit(1);
+}
+if (!CFG.GUILD_ID) {
+  console.error('[Config] GUILD_ID is missing');
+  process.exit(1);
+}
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// DISCORD CLIENT
+// ─────────────────────────────────────────────────────────────
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+  ],
+});
+
+// Per guild state
+const guilds = new Map();
+
+// ─────────────────────────────────────────────────────────────
 // SLASH COMMANDS
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
-const commands = [
+const slashCommands = [
   new SlashCommandBuilder()
     .setName('join')
     .setDescription('Bot entra no seu canal de voz'),
@@ -108,50 +164,45 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('sensitivity')
-    .setDescription('Ajusta o limiar de ruído')
+    .setDescription('Ajusta o limiar RMS')
     .addNumberOption((opt) =>
       opt.setName('value')
-        .setDescription('Maior = menos sensível')
-        .setMinValue(0.01)
+        .setDescription('Menor = mais sensível')
+        .setMinValue(0.001)
         .setMaxValue(0.2)
         .setRequired(true)
     ),
+
+  new SlashCommandBuilder()
+    .setName('silence')
+    .setDescription('Ajusta o tempo de silêncio antes de processar')
+    .addIntegerOption((opt) =>
+      opt.setName('value')
+        .setDescription('Milissegundos')
+        .setMinValue(200)
+        .setMaxValue(5000)
+        .setRequired(true)
+    ),
+
+  new SlashCommandBuilder()
+    .setName('debug')
+    .setDescription('Mostra a configuração atual do bot'),
 ].map((cmd) => cmd.toJSON());
 
 async function registerSlashCommands() {
-  if (!CLIENT_ID || !GUILD_ID) {
-    throw new Error('CLIENT_ID ou GUILD_ID não definidos no .env');
-  }
-
-  const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
+  const rest = new REST({ version: '10' }).setToken(CFG.BOT_TOKEN);
+  await rest.put(
+    Routes.applicationGuildCommands(CFG.CLIENT_ID, CFG.GUILD_ID),
+    { body: slashCommands }
+  );
 }
 
-// ─────────────────────────────────────────────
-// STATE
-// ─────────────────────────────────────────────
-
-// Per guild: { connection, player, history, channelName, busy }
-const guilds = new Map();
-let currentThreshold = 0.04;
-
-// ─────────────────────────────────────────────
-// DISCORD CLIENT
-// ─────────────────────────────────────────────
-
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-  ],
-});
-
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // HELPERS
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function log(...args) {
+  console.log(...args);
 }
 
 function findFirstExisting(candidates) {
@@ -165,31 +216,34 @@ function findFirstExisting(candidates) {
   return candidates[0];
 }
 
-function safeUnlink(filePath) {
+function safeDelete(filePath) {
   fs.unlink(filePath, () => {});
 }
 
-function normalizeSpeechText(text) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function normalizeText(text) {
   return String(text || '')
-    .replace(/\*\*/g, '')
-    .replace(/\*/g, '')
-    .replace(/`/g, '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`/g, ' ')
+    .replace(/\*\*/g, ' ')
+    .replace(/\*/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function extractCompleteSentences(buffer, final = false) {
+function splitCompleteSentences(buffer, final = false) {
   const sentences = [];
-  let rest = buffer.trim();
+  let rest = buffer.trimStart();
 
-  while (true) {
-    const match = rest.match(/^(.+?[.!?]+)(?=\s|$)/s);
+  while (rest.length > 0) {
+    const match = rest.match(/^([\s\S]*?[.!?]+)(?:\s|$)/);
     if (!match) break;
-
     const sentence = match[1].trim();
     if (sentence) sentences.push(sentence);
-
-    rest = rest.slice(match[1].length).trimStart();
+    rest = rest.slice(match[0].length).trimStart();
   }
 
   if (final && rest.trim()) {
@@ -200,11 +254,27 @@ function extractCompleteSentences(buffer, final = false) {
   return { sentences, rest };
 }
 
-// ─────────────────────────────────────────────
-// AUDIO UTILITIES
-// ─────────────────────────────────────────────
+function ensureGuildState(guildId) {
+  let state = guilds.get(guildId);
+  if (!state) {
+    state = {
+      connection: null,
+      player: null,
+      history: [],
+      channelName: '',
+      ttsBusy: false,
+      speechQueue: [],
+    };
+    guilds.set(guildId, state);
+  }
+  return state;
+}
 
-function downsample(buffer) {
+// ─────────────────────────────────────────────────────────────
+// AUDIO UTILITIES
+// ─────────────────────────────────────────────────────────────
+
+function downsampleDiscordPcmToWhisper(buffer) {
   const input = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
   const ratio = DISCORD_SAMPLE_RATE / WHISPER_SAMPLE_RATE;
   const outLen = Math.floor(input.length / DISCORD_CHANNELS / ratio);
@@ -212,7 +282,9 @@ function downsample(buffer) {
 
   for (let i = 0; i < outLen; i++) {
     const srcIndex = Math.floor(i * ratio) * DISCORD_CHANNELS;
-    output[i] = (input[srcIndex] + input[srcIndex + 1]) >> 1;
+    const left = input[srcIndex] || 0;
+    const right = input[srcIndex + 1] || 0;
+    output[i] = (left + right) >> 1;
   }
 
   return Buffer.from(output.buffer);
@@ -220,12 +292,14 @@ function downsample(buffer) {
 
 function calcRms(buffer) {
   const samples = new Int16Array(buffer.buffer, buffer.byteOffset, buffer.byteLength / 2);
+  if (!samples.length) return 0;
+
   let sum = 0;
   for (let i = 0; i < samples.length; i++) {
     const s = samples[i] / 32768;
     sum += s * s;
   }
-  return Math.sqrt(sum / Math.max(samples.length, 1));
+  return Math.sqrt(sum / samples.length);
 }
 
 function writePcmToWav(pcmBuffer, filePath) {
@@ -259,23 +333,27 @@ function writePcmToWav(pcmBuffer, filePath) {
   });
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // WHISPER
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 function transcribe(wavPath) {
   return new Promise((resolve, reject) => {
-    if (!WHISPER_BIN || !fs.existsSync(WHISPER_BIN)) {
-      reject(new Error(`Whisper binary não encontrado: ${WHISPER_BIN}`));
+    if (!CFG.WHISPER_BIN || !fs.existsSync(CFG.WHISPER_BIN)) {
+      reject(new Error(`Whisper binary not found: ${CFG.WHISPER_BIN}`));
+      return;
+    }
+    if (!fs.existsSync(CFG.WHISPER_MODEL)) {
+      reject(new Error(`Whisper model not found: ${CFG.WHISPER_MODEL}`));
       return;
     }
 
     execFile(
-      WHISPER_BIN,
+      CFG.WHISPER_BIN,
       [
-        '-m', WHISPER_MODEL_PATH,
+        '-m', CFG.WHISPER_MODEL,
         '-f', wavPath,
-        '--language', WHISPER_LANG,
+        '--language', CFG.WHISPER_LANG,
         '--no-timestamps',
         '-nt',
       ],
@@ -293,21 +371,19 @@ function transcribe(wavPath) {
           .join(' ')
           .trim();
 
-        resolve(text);
+        resolve(normalizeText(text));
       }
     );
   });
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // OLLAMA
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 async function queryOllamaNonStreaming(guildId, username, userText) {
-  const state = guilds.get(guildId);
-  if (!state) return null;
-
-  const model = process.env.OLLAMA_MODEL_OVERRIDE || OLLAMA_MODEL;
+  const state = ensureGuildState(guildId);
+  const model = process.env.OLLAMA_MODEL_OVERRIDE || CFG.OLLAMA_MODEL;
 
   state.history.push({
     role: 'user',
@@ -316,11 +392,11 @@ async function queryOllamaNonStreaming(guildId, username, userText) {
 
   try {
     const response = await axios.post(
-      OLLAMA_URL,
+      CFG.OLLAMA_URL,
       {
         model,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: CFG.SYSTEM_PROMPT },
           ...state.history,
         ],
         stream: false,
@@ -328,23 +404,24 @@ async function queryOllamaNonStreaming(guildId, username, userText) {
       { timeout: 60000 }
     );
 
-    const reply = normalizeSpeechText(response.data?.message?.content || '');
+    const reply = normalizeText(response.data?.message?.content || '');
     if (!reply) return null;
 
     state.history.push({ role: 'assistant', content: reply });
-    if (state.history.length > 20) state.history = state.history.slice(-20);
+    if (state.history.length > CFG.OLLAMA_MAX_HISTORY) {
+      state.history = state.history.slice(-CFG.OLLAMA_MAX_HISTORY);
+    }
+
     return reply;
   } catch (err) {
-    console.error('[Ollama] Erro:', err.message);
+    console.error('[Ollama] Non-stream error:', err.message);
     return 'Desculpe, não consegui acessar o modelo de IA agora.';
   }
 }
 
-async function streamOllamaAndQueueSpeech(guildId, username, userText, onSegmentReady) {
-  const state = guilds.get(guildId);
-  if (!state) return;
-
-  const model = process.env.OLLAMA_MODEL_OVERRIDE || OLLAMA_MODEL;
+async function queryOllamaStream(guildId, username, userText, onSentence) {
+  const state = ensureGuildState(guildId);
+  const model = process.env.OLLAMA_MODEL_OVERRIDE || CFG.OLLAMA_MODEL;
 
   state.history.push({
     role: 'user',
@@ -354,11 +431,11 @@ async function streamOllamaAndQueueSpeech(guildId, username, userText, onSegment
   let response;
   try {
     response = await axios.post(
-      OLLAMA_URL,
+      CFG.OLLAMA_URL,
       {
         model,
         messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
+          { role: 'system', content: CFG.SYSTEM_PROMPT },
           ...state.history,
         ],
         stream: true,
@@ -366,26 +443,26 @@ async function streamOllamaAndQueueSpeech(guildId, username, userText, onSegment
       { responseType: 'stream', timeout: 60000 }
     );
   } catch (err) {
-    console.error('[Ollama] Streaming falhou:', err.message);
+    console.error('[Ollama] Streaming request failed:', err.message);
     const fallback = await queryOllamaNonStreaming(guildId, username, userText);
-    if (fallback) await onSegmentReady(fallback, true);
-    return;
+    if (fallback) onSentence(fallback, true);
+    return fallback || '';
   }
 
   let ndjsonBuffer = '';
   let assistantText = '';
-  let buffer = '';
-  let streamDone = false;
+  let sentenceBuffer = '';
 
-  const processBuffer = async (final = false) => {
-    const { sentences, rest } = extractCompleteSentences(buffer, final);
-    buffer = rest;
+  const flushSentences = (final = false) => {
+    const extracted = splitCompleteSentences(sentenceBuffer, final);
+    sentenceBuffer = extracted.rest;
 
-    for (const sentence of sentences) {
-      const cleaned = normalizeSpeechText(sentence);
-      if (!cleaned) continue;
-      assistantText += (assistantText ? ' ' : '') + cleaned;
-      await onSegmentReady(cleaned, false);
+    for (const sentence of extracted.sentences) {
+      const clean = normalizeText(sentence);
+      if (clean) {
+        assistantText += (assistantText ? ' ' : '') + clean;
+        onSentence(clean, false);
+      }
     }
   };
 
@@ -393,10 +470,10 @@ async function streamOllamaAndQueueSpeech(guildId, username, userText, onSegment
     response.data.on('data', (chunk) => {
       ndjsonBuffer += chunk.toString('utf8');
 
-      let nlIndex;
-      while ((nlIndex = ndjsonBuffer.indexOf('\n')) !== -1) {
-        const rawLine = ndjsonBuffer.slice(0, nlIndex).trim();
-        ndjsonBuffer = ndjsonBuffer.slice(nlIndex + 1);
+      let newlineIndex;
+      while ((newlineIndex = ndjsonBuffer.indexOf('\n')) !== -1) {
+        const rawLine = ndjsonBuffer.slice(0, newlineIndex).trim();
+        ndjsonBuffer = ndjsonBuffer.slice(newlineIndex + 1);
         if (!rawLine) continue;
 
         let obj;
@@ -408,85 +485,46 @@ async function streamOllamaAndQueueSpeech(guildId, username, userText, onSegment
 
         const token = obj?.message?.content || '';
         if (token) {
-          buffer += token;
+          sentenceBuffer += token;
         }
 
         if (obj?.done) {
-          streamDone = true;
+          flushSentences(true);
+        } else {
+          flushSentences(false);
         }
-      }
-
-      // Process incrementally after each chunk.
-      processBuffer(false).catch(reject);
-
-      if (streamDone) {
-        processBuffer(true)
-          .then(() => resolve())
-          .catch(reject);
       }
     });
 
     response.data.on('end', () => {
-      processBuffer(true)
-        .then(() => resolve())
-        .catch(reject);
+      flushSentences(true);
+      resolve();
     });
 
     response.data.on('error', reject);
   });
 
-  const reply = normalizeSpeechText(assistantText || buffer);
-  const finalReply = reply || 'Desculpe, não consegui gerar uma resposta agora.';
+  const finalReply = normalizeText(assistantText || sentenceBuffer);
+  if (finalReply) {
+    state.history.push({ role: 'assistant', content: finalReply });
+    if (state.history.length > CFG.OLLAMA_MAX_HISTORY) {
+      state.history = state.history.slice(-CFG.OLLAMA_MAX_HISTORY);
+    }
+  }
 
-  state.history.push({ role: 'assistant', content: finalReply });
-  if (state.history.length > 20) state.history = state.history.slice(-20);
+  return finalReply;
 }
 
-async function queryAndSpeak(guildId, username, userText, speakSegment) {
-  await streamOllamaAndQueueSpeech(guildId, username, userText, speakSegment);
-}
-
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // TTS
-// ─────────────────────────────────────────────
-
-async function generateTtsLocal(text, outputPath) {
-  const safeText = String(text || '')
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, ' ')
-    .trim();
-
-  const asciiRatio = (safeText.match(/[a-zA-Z]/g) || []).length / Math.max(safeText.length, 1);
-  const lang = asciiRatio > 0.85 ? 'en-us' : 'pt-br';
-  const voice = lang === 'en-us' ? 'bf_emma' : 'pf_dora';
-
-  const script = `
-from kokoro_onnx import Kokoro
-import soundfile as sf
-
-k = Kokoro(${JSON.stringify(KOKORO_MODEL)}, ${JSON.stringify(KOKORO_VOICES)})
-samples, sr = k.create(${JSON.stringify(safeText)}, voice=${JSON.stringify(voice)}, speed=1.0, lang=${JSON.stringify(lang)})
-sf.write(${JSON.stringify(outputPath)}, samples, sr)
-`;
-
-  return new Promise((resolve, reject) => {
-    execFile(TTS_PYTHON_BIN, ['-c', script], { timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) {
-        reject(new Error(stderr || err.message));
-        return;
-      }
-      resolve();
-    });
-  });
-}
+// ─────────────────────────────────────────────────────────────
 
 async function generateTtsViaServer(text, outputPath) {
   const asciiRatio = (text.match(/[a-zA-Z]/g) || []).length / Math.max(text.length, 1);
   const lang = asciiRatio > 0.85 ? 'en-us' : 'pt-br';
 
   const response = await axios.post(
-    TTS_SERVER_URL,
+    CFG.TTS_SERVER_URL,
     { text, lang },
     { responseType: 'arraybuffer', timeout: 20000 }
   );
@@ -494,24 +532,72 @@ async function generateTtsViaServer(text, outputPath) {
   fs.writeFileSync(outputPath, Buffer.from(response.data));
 }
 
-async function generateTts(text, outputPath) {
-  if (TTS_SERVER_URL) {
-    return generateTtsViaServer(text, outputPath);
-  }
-  return generateTtsLocal(text, outputPath);
+function generateTtsLocal(text, outputPath) {
+  return new Promise((resolve, reject) => {
+    if (!CFG.PIPER_BIN || !fs.existsSync(CFG.PIPER_BIN)) {
+      reject(new Error(`Piper binary not found: ${CFG.PIPER_BIN}`));
+      return;
+    }
+    if (!fs.existsSync(CFG.PIPER_MODEL)) {
+      reject(new Error(`Piper model not found: ${CFG.PIPER_MODEL}`));
+      return;
+    }
+
+    const args = [
+      '--model', CFG.PIPER_MODEL,
+      '--output_file', outputPath,
+      '--length_scale', String(CFG.PIPER_LENGTH_SCALE),
+      '--noise_scale', String(CFG.PIPER_NOISE_SCALE),
+      '--noise_w', String(CFG.PIPER_NOISE_W),
+    ];
+
+    const proc = spawn(CFG.PIPER_BIN, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+
+    let stderr = '';
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (CFG.DEBUG) process.stdout.write(d);
+    });
+
+    proc.on('error', reject);
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(stderr || `Piper exited with code ${code}`));
+        return;
+      }
+      resolve();
+    });
+
+    proc.stdin.write(String(text || '').trim());
+    proc.stdin.end();
+  });
 }
 
-// ─────────────────────────────────────────────
-// AUDIO PLAYER
-// ─────────────────────────────────────────────
+async function generateTts(text, outputPath) {
+  const clean = normalizeText(text);
+  if (!clean) throw new Error('Empty TTS text');
+
+  if (CFG.TTS_ENGINE === 'server' && CFG.TTS_SERVER_URL) {
+    return generateTtsViaServer(clean, outputPath);
+  }
+
+  return generateTtsLocal(clean, outputPath);
+}
+
+// ─────────────────────────────────────────────────────────────
+// PLAYBACK
+// ─────────────────────────────────────────────────────────────
 
 function playAudio(guildId, audioPath) {
   const state = guilds.get(guildId);
-  if (!state?.player) return Promise.resolve();
+  if (!state?.player || !state?.connection) return Promise.resolve();
 
   return new Promise((resolve) => {
     const stream = fs.createReadStream(audioPath);
-    const resource = createAudioResource(stream, { inputType: StreamType.Arbitrary });
+    const resource = createAudioResource(stream, {
+      inputType: StreamType.Arbitrary,
+      inlineVolume: false,
+    });
 
     const done = () => {
       state.player.off('error', onError);
@@ -519,7 +605,7 @@ function playAudio(guildId, audioPath) {
     };
 
     const onError = (err) => {
-      console.error('[Player] Erro:', err.message);
+      console.error('[Player] Error:', err.message);
       done();
     };
 
@@ -529,113 +615,126 @@ function playAudio(guildId, audioPath) {
   });
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // PIPELINE
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 async function processAudio(guildId, userId, username, pcmChunks) {
+  const state = guilds.get(guildId);
+  if (!state) return;
+
   const tmpDir = os.tmpdir();
   const wavPath = path.join(tmpDir, `discord_${guildId}_${userId}_${Date.now()}.wav`);
 
+  const ttsQueue = [];
+  let ttsBusy = false;
+  let streamFinished = false;
+  let resolveDrain;
+  const drainPromise = new Promise((resolve) => {
+    resolveDrain = resolve;
+  });
+
+  const maybeResolveDrain = () => {
+    if (streamFinished && !ttsBusy && ttsQueue.length === 0) {
+      resolveDrain();
+    }
+  };
+
+  const pumpTtsQueue = async () => {
+    if (ttsBusy) return;
+    ttsBusy = true;
+
+    while (ttsQueue.length > 0) {
+      const segment = normalizeText(ttsQueue.shift());
+      if (!segment) continue;
+
+      const ttsPath = path.join(
+        tmpDir,
+        `tts_${guildId}_${Date.now()}_${Math.random().toString(16).slice(2)}.wav`
+      );
+
+      try {
+        if (CFG.DEBUG) console.log('[TTS] Segment:', segment);
+        await generateTts(segment, ttsPath);
+        await playAudio(guildId, ttsPath);
+      } catch (err) {
+        console.error('[TTS] Error:', err.message);
+      } finally {
+        safeDelete(ttsPath);
+      }
+    }
+
+    ttsBusy = false;
+    maybeResolveDrain();
+  };
+
+  const enqueueSegment = (segment) => {
+    const clean = normalizeText(segment);
+    if (!clean) return;
+    ttsQueue.push(clean);
+    void pumpTtsQueue();
+  };
+
   try {
     const rawPcm = Buffer.concat(pcmChunks);
-    const pcm16khz = downsample(rawPcm);
+    const pcm16khz = downsampleDiscordPcmToWhisper(rawPcm);
 
     const durationMs = (pcm16khz.length / 2 / WHISPER_SAMPLE_RATE) * 1000;
-    if (durationMs < MIN_AUDIO_DURATION_MS) {
-      console.log(`[Filter] Ignorado: ${Math.round(durationMs)}ms (abaixo do mínimo)`);
+    const rms = calcRms(pcm16khz);
+
+    if (CFG.DEBUG) {
+      console.log(`[DEBUG] ${username} duration=${Math.round(durationMs)}ms rms=${rms.toFixed(4)}`);
+    }
+
+    if (durationMs < CFG.MIN_AUDIO_MS) {
+      console.log(`[Filter] Ignored ${username}: ${Math.round(durationMs)}ms below minimum`);
       return;
     }
 
-    const rms = calcRms(pcm16khz);
-    if (rms < currentThreshold) {
-      console.log(`[Filter] Ignorado: RMS ${rms.toFixed(4)} abaixo do threshold ${currentThreshold}`);
+    if (rms < CFG.RMS_THRESHOLD) {
+      console.log(`[Filter] Ignored ${username}: RMS ${rms.toFixed(4)} below threshold ${CFG.RMS_THRESHOLD}`);
       return;
     }
 
     await writePcmToWav(pcm16khz, wavPath);
-    console.log(`[Whisper] Transcrevendo ${username} (${Math.round(durationMs)}ms, RMS ${rms.toFixed(4)})...`);
+    console.log(`[Whisper] Transcribing ${username}...`);
 
-    const text = normalizeSpeechText(await transcribe(wavPath));
-    if (!text || text.length < 3) {
-      console.log('[Whisper] Transcrição vazia, ignorando.');
+    const text = await transcribe(wavPath);
+    if (!text || text.length < 2) {
+      console.log('[Whisper] Empty transcription, ignoring.');
       return;
     }
 
-    console.log(`[${username}]: ${text}`);
+    console.log(`[${username}] ${text}`);
 
-    const state = guilds.get(guildId);
-    if (!state) return;
+    console.log('[Ollama] Streaming reply...');
+    const reply = await queryOllamaStream(guildId, username, text, enqueueSegment);
 
-    const ttsQueue = [];
-    let ttsRunning = false;
-    let streamFinished = false;
-    let resolveDrain;
-    const drainPromise = new Promise((resolve) => {
-      resolveDrain = resolve;
-    });
-
-    const maybeResolveDrain = () => {
-      if (streamFinished && !ttsRunning && ttsQueue.length === 0) {
-        resolveDrain();
-      }
-    };
-
-    const pumpTtsQueue = async () => {
-      if (ttsRunning) return;
-      ttsRunning = true;
-
-      while (ttsQueue.length > 0) {
-        const segment = normalizeSpeechText(ttsQueue.shift());
-        if (!segment || segment.length < 2) continue;
-
-        const ttsPath = path.join(tmpDir, `tts_${guildId}_${Date.now()}_${Math.random().toString(16).slice(2)}.wav`);
-        try {
-          console.log(`[Bot/TTS] ${segment}`);
-          await generateTts(segment, ttsPath);
-          await playAudio(guildId, ttsPath);
-        } catch (err) {
-          console.error('[TTS] Erro:', err.message);
-        } finally {
-          safeUnlink(ttsPath);
-        }
-      }
-
-      ttsRunning = false;
-      maybeResolveDrain();
-    };
-
-    const enqueueSegment = async (segment, final = false) => {
-      const cleaned = normalizeSpeechText(segment);
-      if (cleaned) {
-        ttsQueue.push(cleaned);
-        void pumpTtsQueue();
-      }
-      if (final) {
-        streamFinished = true;
-        maybeResolveDrain();
-      }
-    };
-
-    console.log('[Ollama] Streaming...');
-    await queryAndSpeak(guildId, username, text, enqueueSegment);
+    if (!reply) {
+      enqueueSegment('Desculpe, não consegui gerar uma resposta agora.');
+    }
 
     streamFinished = true;
     maybeResolveDrain();
     await drainPromise;
   } catch (err) {
-    console.error('[Pipeline] Erro:', err.message);
+    console.error('[Pipeline] Error:', err.message);
   } finally {
-    safeUnlink(wavPath);
+    safeDelete(wavPath);
   }
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 // VOICE CONNECTION
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 async function connectToChannel(channel) {
   const guildId = channel.guild.id;
+  const state = ensureGuildState(guildId);
+
+  if (state.connection) {
+    try { state.connection.destroy(); } catch {}
+  }
 
   const connection = joinVoiceChannel({
     channelId: channel.id,
@@ -648,45 +747,54 @@ async function connectToChannel(channel) {
   const player = createAudioPlayer();
   connection.subscribe(player);
 
+  state.connection = connection;
+  state.player = player;
+  state.channelName = channel.name;
+
+  player.on('error', (err) => {
+    console.error('[Voice Player] Error:', err.message);
+  });
+
+  connection.on('error', (err) => {
+    console.error('[Voice Connection] Error:', err.message);
+  });
+
   try {
     await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
   } catch {
-    connection.destroy();
-    throw new Error('Não foi possível conectar ao canal em 20 segundos.');
+    try { connection.destroy(); } catch {}
+    state.connection = null;
+    state.player = null;
+    throw new Error('Could not connect to voice channel within 20 seconds.');
   }
 
-  guilds.set(guildId, {
-    connection,
-    player,
-    history: [],
-    channelName: channel.name,
-  });
-
-  connection.on(VoiceConnectionStatus.Disconnected, async () => {
-    try {
-      await Promise.race([
-        entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-        entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
-      ]);
-    } catch {
-      connection.destroy();
-      guilds.delete(guildId);
-    }
-  });
-
   startListening(guildId);
-  console.log(`[Bot] Entrou em #${channel.name} em ${channel.guild.name}`);
+  console.log(`[Bot] Joined #${channel.name} in ${channel.guild.name}`);
 }
 
-// ─────────────────────────────────────────────
-// AUDIO RECEIVER
-// ─────────────────────────────────────────────
-
-function startListening(guildId) {
+function disconnectGuild(guildId) {
   const state = guilds.get(guildId);
   if (!state) return;
 
-  const { connection } = state;
+  try {
+    if (state.connection) state.connection.destroy();
+  } catch {}
+
+  state.connection = null;
+  state.player = null;
+  state.speechQueue = [];
+  state.ttsBusy = false;
+}
+
+// ─────────────────────────────────────────────────────────────
+// LISTENING
+// ─────────────────────────────────────────────────────────────
+
+function startListening(guildId) {
+  const state = guilds.get(guildId);
+  if (!state?.connection) return;
+
+  const connection = state.connection;
   const receiver = connection.receiver;
 
   const pendingTimers = new Map();
@@ -702,7 +810,7 @@ function startListening(guildId) {
     processing = true;
 
     processAudio(job.guildId, job.userId, job.username, job.chunks)
-      .catch((err) => console.error('[Queue] Erro:', err.message))
+      .catch((err) => console.error('[Queue] Error:', err.message))
       .finally(() => {
         processing = false;
         drainQueue();
@@ -710,7 +818,7 @@ function startListening(guildId) {
   };
 
   receiver.speaking.on('start', (userId) => {
-    if (userId === client.user?.id) return;
+    if (client.user && userId === client.user.id) return;
 
     if (pendingTimers.has(userId)) {
       clearTimeout(pendingTimers.get(userId));
@@ -723,7 +831,7 @@ function startListening(guildId) {
     const audioStream = receiver.subscribe(userId, {
       end: {
         behavior: EndBehaviorType.AfterSilence,
-        duration: SILENCE_DURATION_MS,
+        duration: CFG.SILENCE_MS,
       },
     });
 
@@ -734,6 +842,14 @@ function startListening(guildId) {
     });
 
     const chunks = [];
+
+    audioStream.on('error', (err) => {
+      console.error('[Audio Stream] Error:', err.message);
+    });
+
+    decoder.on('error', (err) => {
+      console.error('[Decoder] Error:', err.message);
+    });
 
     audioStream
       .pipe(decoder)
@@ -751,204 +867,380 @@ function startListening(guildId) {
           pendingChunks.delete(userId);
           if (finalChunks.length === 0) return;
 
+          const job = { guildId, userId, username, chunks: finalChunks };
+
           if (!processing) {
             processing = true;
-            processAudio(guildId, userId, username, finalChunks)
-              .catch((err) => console.error('[Audio] Erro:', err.message))
+            processAudio(job.guildId, job.userId, job.username, job.chunks)
+              .catch((err) => console.error('[Audio] Error:', err.message))
               .finally(() => {
                 processing = false;
                 drainQueue();
               });
           } else {
-            queue.push({ guildId, userId, username, chunks: finalChunks });
+            queue.push(job);
           }
-        }, DEBOUNCE_MS);
+        }, CFG.DEBOUNCE_MS);
 
         pendingTimers.set(userId, timer);
       })
-      .on('error', (err) => console.error('[Decoder] Erro:', err.message));
+      .on('error', (err) => {
+        console.error('[Pipe] Error:', err.message);
+      });
+  });
+
+  receiver.speaking.on('error', (err) => {
+    console.error('[Receiver] Error:', err.message);
   });
 }
 
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
+// COMMANDS
+// ─────────────────────────────────────────────────────────────
+
+async function handleJoin(guildId, voiceChannel) {
+  const state = ensureGuildState(guildId);
+  if (state.connection) disconnectGuild(guildId);
+  await connectToChannel(voiceChannel);
+}
+
+async function handleLeave(guildId) {
+  disconnectGuild(guildId);
+}
+
+async function handleClear(guildId) {
+  const state = ensureGuildState(guildId);
+  state.history = [];
+}
+
+async function handleStatus(interactionOrReply, guildId) {
+  const state = guilds.get(guildId);
+  const model = process.env.OLLAMA_MODEL_OVERRIDE || CFG.OLLAMA_MODEL;
+
+  const text = state
+    ? [
+      '**Status**',
+      `Canal: **${state.channelName}**`,
+      `Modelo: \`${model}\``,
+      `Whisper: \`${CFG.WHISPER_MODEL}\``,
+      `TTS: \`${CFG.TTS_ENGINE}\``,
+      `RMS: \`${CFG.RMS_THRESHOLD}\``,
+      `Silence: \`${CFG.SILENCE_MS}ms\``,
+      `Debounce: \`${CFG.DEBOUNCE_MS}ms\``,
+      `Histórico: ${state.history.length} mensagens`,
+    ].join('\n')
+    : [
+      '**Status**',
+      'Não conectado a nenhum canal.',
+      `Modelo: \`${model}\``,
+      `Whisper: \`${CFG.WHISPER_MODEL}\``,
+      `TTS: \`${CFG.TTS_ENGINE}\``,
+    ].join('\n');
+
+  if (typeof interactionOrReply.reply === 'function') {
+    await interactionOrReply.reply(text);
+  } else if (typeof interactionOrReply.editReply === 'function') {
+    await interactionOrReply.editReply(text);
+  }
+}
+
+async function handleModelChange(interaction, guildId, newModel) {
+  process.env.OLLAMA_MODEL_OVERRIDE = newModel;
+  await interaction.reply(`Modelo trocado para: \`${newModel}\``);
+}
+
+async function handleSensitivity(interaction, value) {
+  CFG.RMS_THRESHOLD = value;
+  await interaction.reply(`RMS threshold ajustado para \`${value}\``);
+}
+
+async function handleSilence(interaction, value) {
+  CFG.SILENCE_MS = value;
+  await interaction.reply(`Silence ajustado para \`${value}ms\``);
+}
+
+async function executePrefixCommand(message) {
+  const content = message.content.trim();
+  if (!content.startsWith(CFG.PREFIX)) return;
+
+  const args = content.slice(CFG.PREFIX.length).trim().split(/\s+/);
+  const command = (args.shift() || '').toLowerCase();
+  const guildId = message.guild.id;
+
+  switch (command) {
+    case 'join': {
+      const voiceChannel = message.member?.voice?.channel;
+      if (!voiceChannel) {
+        await message.reply('Você precisa estar em um canal de voz primeiro.');
+        return;
+      }
+      await handleJoin(guildId, voiceChannel);
+      await message.reply(`Entrei em **${voiceChannel.name}**.`);
+      break;
+    }
+
+    case 'leave': {
+      await handleLeave(guildId);
+      await message.reply('Desconectado.');
+      break;
+    }
+
+    case 'clear': {
+      await handleClear(guildId);
+      await message.reply('Histórico limpo.');
+      break;
+    }
+
+    case 'model': {
+      const newModel = args.join(' ').trim();
+      if (!newModel) {
+        await message.reply(`Uso: ${CFG.PREFIX}model llama3.2:3b`);
+        return;
+      }
+      process.env.OLLAMA_MODEL_OVERRIDE = newModel;
+      await message.reply(`Modelo trocado para: \`${newModel}\``);
+      break;
+    }
+
+    case 'status': {
+      const state = guilds.get(guildId);
+      const model = process.env.OLLAMA_MODEL_OVERRIDE || CFG.OLLAMA_MODEL;
+      await message.reply(
+        state
+          ? `Canal: ${state.channelName}\nModelo: ${model}\nRMS: ${CFG.RMS_THRESHOLD}\nSilence: ${CFG.SILENCE_MS}ms`
+          : `Não conectado.\nModelo: ${model}`
+      );
+      break;
+    }
+
+    case 'sensitivity': {
+      const value = Number(args[0]);
+      if (!Number.isFinite(value)) {
+        await message.reply(`Uso: ${CFG.PREFIX}sensitivity 0.015`);
+        return;
+      }
+      CFG.RMS_THRESHOLD = value;
+      await message.reply(`RMS threshold ajustado para ${value}`);
+      break;
+    }
+
+    case 'silence': {
+      const value = Number(args[0]);
+      if (!Number.isFinite(value)) {
+        await message.reply(`Uso: ${CFG.PREFIX}silence 1000`);
+        return;
+      }
+      CFG.SILENCE_MS = value;
+      await message.reply(`Silence ajustado para ${value}ms`);
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // DISCORD EVENTS
-// ─────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────
 
 let bootstrapped = false;
 
-async function onClientReady() {
+async function onReady() {
   if (bootstrapped) return;
   bootstrapped = true;
 
-  console.log(`\n[Bot] Logado como ${client.user.tag}`);
-  console.log('[Slash] Registrando comandos...');
+  console.log(`[Bot] Logged in as ${client.user.tag}`);
+  console.log('[Slash] Registering slash commands...');
   await registerSlashCommands();
-  console.log('[Slash] Comandos registrados.');
-  console.log(`[Bot] Modelo: ${OLLAMA_MODEL}`);
-  console.log(`[Bot] Whisper: ${WHISPER_MODEL_PATH}`);
-  console.log(`[Bot] Idioma: ${WHISPER_LANG}`);
-  console.log(`[Bot] Threshold inicial: ${currentThreshold}`);
-  console.log(`[Bot] Silence duration: ${SILENCE_DURATION_MS}ms`);
-  console.log(`[Bot] Debounce: ${DEBOUNCE_MS}ms`);
+  console.log('[Slash] Commands registered.');
+  console.log(`[Bot] Model: ${CFG.OLLAMA_MODEL}`);
+  console.log(`[Bot] Whisper: ${CFG.WHISPER_MODEL}`);
+  console.log(`[Bot] Whisper lang: ${CFG.WHISPER_LANG}`);
+  console.log(`[Bot] TTS: ${CFG.TTS_ENGINE}`);
+  console.log(`[Bot] RMS threshold: ${CFG.RMS_THRESHOLD}`);
+  console.log(`[Bot] Silence: ${CFG.SILENCE_MS}ms`);
+  console.log(`[Bot] Debounce: ${CFG.DEBOUNCE_MS}ms`);
 
-  if (AUTO_JOIN_CHANNEL && GUILD_ID) {
+  if (CFG.AUTO_JOIN_CHANNEL_ID && CFG.GUILD_ID) {
     try {
-      await client.guilds.fetch(GUILD_ID);
-      const channel = await client.channels.fetch(AUTO_JOIN_CHANNEL);
+      await client.guilds.fetch(CFG.GUILD_ID);
+      const channel = await client.channels.fetch(CFG.AUTO_JOIN_CHANNEL_ID);
       if (channel?.isVoiceBased()) {
         await connectToChannel(channel);
       } else {
-        console.error('[Auto-join] O canal informado não é um canal de voz.');
+        console.error('[Auto-join] The configured channel is not voice-based.');
       }
     } catch (err) {
-      console.error('[Auto-join] Falhou:', err.message);
+      console.error('[Auto-join] Failed:', err.message);
     }
   }
 }
 
-client.once('ready', onClientReady);
-client.once('clientReady', onClientReady);
+client.once('ready', onReady);
+client.once('clientReady', onReady);
 
 client.on('voiceStateUpdate', async (oldState, newState) => {
-  if (!OWNER_USER_ID || newState.member?.id !== OWNER_USER_ID) return;
+  if (!CFG.OWNER_USER_ID || newState.member?.id !== CFG.OWNER_USER_ID) return;
   const guildId = newState.guild.id;
 
   if (newState.channelId && newState.channelId !== oldState.channelId) {
     const existing = guilds.get(guildId);
-    if (existing) {
-      existing.connection.destroy();
-      guilds.delete(guildId);
-    }
+    if (existing) disconnectGuild(guildId);
 
     try {
       await connectToChannel(newState.channel);
     } catch (err) {
-      console.error('[Auto-follow] Falhou:', err.message);
+      console.error('[Auto-follow] Failed:', err.message);
     }
   }
 
   if (!newState.channelId && oldState.channelId) {
     const state = guilds.get(guildId);
     if (state) {
-      state.connection.destroy();
+      disconnectGuild(guildId);
       guilds.delete(guildId);
-      console.log('[Bot] Dono saiu — desconectado.');
+      console.log('[Bot] Owner left — disconnected.');
     }
   }
 });
 
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isChatInputCommand()) return;
+  try {
+    if (!interaction.isChatInputCommand()) return;
 
-  const { commandName, guildId } = interaction;
+    const { commandName, guildId } = interaction;
 
-  switch (commandName) {
-    case 'join': {
-      const voiceChannel = interaction.member?.voice?.channel;
-      if (!voiceChannel) {
-        await interaction.reply({ content: 'Você precisa estar em um canal de voz primeiro.', ephemeral: true });
-        return;
+    switch (commandName) {
+      case 'join': {
+        const voiceChannel = interaction.member?.voice?.channel;
+        if (!voiceChannel) {
+          await interaction.reply({ content: 'You need to be in a voice channel first.', ephemeral: true });
+          return;
+        }
+        await interaction.deferReply();
+        try {
+          await handleJoin(guildId, voiceChannel);
+          await interaction.editReply(`Entrei em **${voiceChannel.name}**.`);
+        } catch (err) {
+          await interaction.editReply(`Falha ao entrar: ${err.message}`);
+        }
+        break;
       }
 
-      const existing = guilds.get(guildId);
-      if (existing) {
-        existing.connection.destroy();
-        guilds.delete(guildId);
-      }
-
-      await interaction.deferReply();
-      try {
-        await connectToChannel(voiceChannel);
-        await interaction.editReply(`Entrei em **${voiceChannel.name}**. Estou ouvindo!`);
-      } catch (err) {
-        await interaction.editReply(`Falha ao entrar: ${err.message}`);
-      }
-      break;
-    }
-
-    case 'leave': {
-      const state = guilds.get(guildId);
-      if (state) {
-        state.connection.destroy();
-        guilds.delete(guildId);
+      case 'leave': {
+        await handleLeave(guildId);
         await interaction.reply('Desconectado.');
-      } else {
-        await interaction.reply({ content: 'Não estou em nenhum canal de voz.', ephemeral: true });
+        break;
       }
-      break;
-    }
 
-    case 'clear': {
-      const state = guilds.get(guildId);
-      if (state) {
-        state.history = [];
+      case 'clear': {
+        await handleClear(guildId);
         await interaction.reply('Histórico de conversa limpo.');
-      } else {
-        await interaction.reply({ content: 'Não estou ativo neste servidor.', ephemeral: true });
+        break;
       }
-      break;
-    }
 
-    case 'model': {
-      const newModel = interaction.options.getString('name');
-      process.env.OLLAMA_MODEL_OVERRIDE = newModel;
-      await interaction.reply(`Modelo trocado para: \`${newModel}\`\nVai usar na próxima mensagem.`);
-      break;
-    }
+      case 'model': {
+        const newModel = interaction.options.getString('name', true);
+        await handleModelChange(interaction, guildId, newModel);
+        break;
+      }
 
-    case 'status': {
-      const state = guilds.get(guildId);
-      const model = process.env.OLLAMA_MODEL_OVERRIDE || OLLAMA_MODEL;
-      if (state) {
+      case 'status': {
+        await handleStatus(interaction, guildId);
+        break;
+      }
+
+      case 'sensitivity': {
+        const value = interaction.options.getNumber('value', true);
+        await handleSensitivity(interaction, value);
+        break;
+      }
+
+      case 'silence': {
+        const value = interaction.options.getInteger('value', true);
+        await handleSilence(interaction, value);
+        break;
+      }
+
+      case 'debug': {
         await interaction.reply(
-          `**Status**\n` +
-          `Canal: **${state.channelName}**\n` +
-          `Modelo: \`${model}\`\n` +
-          `Idioma: \`${WHISPER_LANG}\`\n` +
-          `Threshold: \`${currentThreshold}\`\n` +
-          `Histórico: ${state.history.length} mensagens`
+          `\`BOT_TOKEN\`: ${CFG.BOT_TOKEN ? 'set' : 'missing'}\n` +
+          `\`GUILD_ID\`: ${CFG.GUILD_ID}\n` +
+          `\`AUTO_JOIN_CHANNEL_ID\`: ${CFG.AUTO_JOIN_CHANNEL_ID || 'unset'}\n` +
+          `\`OWNER_USER_ID\`: ${CFG.OWNER_USER_ID || 'unset'}\n` +
+          `\`OLLAMA_MODEL\`: ${CFG.OLLAMA_MODEL}\n` +
+          `\`WHISPER_MODEL\`: ${CFG.WHISPER_MODEL}\n` +
+          `\`PIPER_MODEL\`: ${CFG.PIPER_MODEL}\n` +
+          `\`TTS_ENGINE\`: ${CFG.TTS_ENGINE}\n` +
+          `\`RMS_THRESHOLD\`: ${CFG.RMS_THRESHOLD}\n` +
+          `\`MIN_AUDIO_MS\`: ${CFG.MIN_AUDIO_MS}\n` +
+          `\`SILENCE_MS\`: ${CFG.SILENCE_MS}\n` +
+          `\`DEBOUNCE_MS\`: ${CFG.DEBOUNCE_MS}`
         );
-      } else {
-        await interaction.reply(`Não conectado a nenhum canal.\nModelo: \`${model}\``);
+        break;
       }
-      break;
-    }
 
-    case 'sensitivity': {
-      const value = interaction.options.getNumber('value');
-      currentThreshold = value;
-      await interaction.reply(
-        `Sensibilidade ajustada para \`${value}\`.\n` +
-        `(menor = mais sensível | maior = ignora mais ruído de fundo)`
-      );
-      break;
+      default:
+        break;
+    }
+  } catch (err) {
+    console.error('[Interaction] Error:', err.message);
+    if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+      await interaction.reply({ content: `Erro: ${err.message}`, ephemeral: true }).catch(() => {});
     }
   }
 });
 
-// ─────────────────────────────────────────────
-// STARTUP
-// ─────────────────────────────────────────────
+client.on('messageCreate', async (message) => {
+  try {
+    if (message.author.bot) return;
+    if (!message.guild) return;
+    await executePrefixCommand(message);
+  } catch (err) {
+    console.error('[Prefix] Error:', err.message);
+  }
+});
 
-if (!BOT_TOKEN) {
-  console.error('[Erro] BOT_TOKEN não definido no .env');
-  process.exit(1);
-}
+// ─────────────────────────────────────────────────────────────
+// PROCESS HANDLERS
+// ─────────────────────────────────────────────────────────────
 
-client.login(BOT_TOKEN).catch((err) => {
-  console.error('[Erro] Falha no login:', err.message);
-  process.exit(1);
+process.on('unhandledRejection', (reason) => {
+  console.error('[UnhandledRejection]', reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[UncaughtException]', err);
 });
 
 process.on('SIGINT', () => {
-  console.log('\n[Bot] Encerrando...');
+  console.log('\n[Bot] Shutting down...');
   for (const [, state] of guilds) {
     try {
-      state.connection.destroy();
-    } catch {
-      // ignore
-    }
+      if (state.connection) state.connection.destroy();
+    } catch {}
   }
   client.destroy();
   process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n[Bot] Shutting down...');
+  for (const [, state] of guilds) {
+    try {
+      if (state.connection) state.connection.destroy();
+    } catch {}
+  }
+  client.destroy();
+  process.exit(0);
+});
+
+// ─────────────────────────────────────────────────────────────
+// START
+// ─────────────────────────────────────────────────────────────
+
+client.login(CFG.BOT_TOKEN).catch((err) => {
+  console.error('[Login] Failed:', err.message);
+  process.exit(1);
 });
